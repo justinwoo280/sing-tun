@@ -488,6 +488,11 @@ func coalesceTCPPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoSize
 		if !checksumValid(pkt, item.iphLen, unix.IPPROTO_TCP, isV6) {
 			return coalescePktInvalidCSum
 		}
+		if item.pshSet {
+			// The new head supplies the aggregate's TCP header, but PSH still
+			// belongs to its final segment (the old head's tail).
+			pktHead[item.iphLen+tcpFlagsOffset] |= tcpFlagPSH
+		}
 		item.sentSeq = seq
 		extendBy := coalescedLen - len(pktHead)
 		b := bufs[pktBuffsIndex]

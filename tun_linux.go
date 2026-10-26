@@ -300,11 +300,16 @@ func (t *NativeTun) Start() error {
 	}
 	// The kernel rejects writes with EIO while the device is not up (tun_get_user),
 	// so the probe must run after LinkSetUp.
-	if t.vnetHdr && t.gro.canTCPGRO() {
+	t.writeAccess.Lock()
+	probeTCPGRO := t.vnetHdr && t.gro.canTCPGRO()
+	t.writeAccess.Unlock()
+	if probeTCPGRO {
 		err := t.probeTCPGRO()
 		if err != nil {
+			t.writeAccess.Lock()
 			t.gro.disableTCPGRO()
 			t.gro.disableUDPGRO()
+			t.writeAccess.Unlock()
 			if t.options.Logger != nil {
 				t.options.Logger.Warn(E.Cause(err, "disabled TUN TCP & UDP GRO due to GRO probe error"))
 			}
