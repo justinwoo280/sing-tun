@@ -49,6 +49,8 @@ func NewStack(
 		}
 	case "gvisor":
 		return NewGVisor(options)
+	case "lwip":
+		return NewLWIP(options)
 	case "mixed":
 		if options.IncludeAllNetworks {
 			return nil, ErrIncludeAllNetworks
