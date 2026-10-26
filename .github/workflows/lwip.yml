@@ -1,0 +1,69 @@
+name: lwIP integration
+
+on:
+  push:
+    branches: [lwip]
+  pull_request:
+    branches: [lwip]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lwip-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  GOTOOLCHAIN: local
+  GOWORK: 'off'
+
+jobs:
+  backend:
+    name: ${{ matrix.target }} (Go ${{ matrix.go }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {runner: ubuntu-24.04, target: linux_amd64_gnu, library: libsing-lwip.so, go: '1.25.x'}
+          - {runner: ubuntu-24.04, target: linux_amd64_gnu, library: libsing-lwip.so, go: '1.26.x'}
+          - {runner: ubuntu-24.04-arm, target: linux_arm64_gnu, library: libsing-lwip.so, go: '1.26.x'}
+          - {runner: macos-15-intel, target: darwin_amd64, library: libsing-lwip.dylib, go: '1.26.x'}
+          - {runner: macos-15, target: darwin_arm64, library: libsing-lwip.dylib, go: '1.26.x'}
+          - {runner: windows-2022, target: windows_amd64, library: sing-lwip.dll, go: '1.26.x'}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+      - name: Build default and gVisor backends
+        run: |
+          CGO_ENABLED=0 go build .
+          CGO_ENABLED=0 go build -tags with_gvisor .
+      - name: Test bundled-source CGO
+        run: CGO_ENABLED=1 go test -count=1 -tags with_lwip -run '^TestLWIP' .
+      - name: Test pinned prebuilt CGO
+        run: CGO_ENABLED=1 go test -count=1 -tags 'with_lwip with_lwip_prebuilt' -run '^TestLWIP' .
+      - name: Test PureGo with the pinned shared library
+        env:
+          TARGET: ${{ matrix.target }}
+          LIBRARY: ${{ matrix.library }}
+        run: |
+          module="github.com/justinwoo280/sing-lwip/lib/$TARGET"
+          go mod download "$module"
+          directory=$(go list -m -f '{{.Dir}}' "$module")
+          SING_LWIP_LIBRARY="$directory/$LIBRARY" CGO_ENABLED=0 \
+            go test -count=1 -tags 'with_lwip with_purego' -run '^TestLWIP' .
+      - name: Race check
+        if: runner.os == 'Linux'
+        run: CGO_ENABLED=1 go test -race -count=1 -tags with_lwip -run '^TestLWIP' .
+      - name: Check module graph
+        run: |
+          go mod verify
+          git diff --exit-code -- go.mod go.sum
