@@ -158,6 +158,14 @@ func TestLWIPDatagramPoliciesAndReset(t *testing.T) {
 	// The endpoint-independent NAT session already exists. Fragmented DNS must
 	// still go through policy, rather than reuse its existing packet connection.
 	payload := bytes.Repeat([]byte("d"), 24)
+	// A new accepted fragmented destination is judged after native reassembly.
+	// Its held snapshot must resume exactly once and preserve the payload/tuple.
+	for _, p := range lwipTestFragments(lwipTestPacket(1003, payload)) {
+		send(p)
+	}
+	if p := lwipTestReply(t, f, 17); !bytes.Equal(p[28:], payload) || binary.BigEndian.Uint16(p[20:]) != 1003 {
+		t.Fatal("fragmented accept did not resume with its original metadata")
+	}
 	for _, p := range lwipTestFragments(lwipTestPacket(53, payload)) {
 		send(p)
 	}

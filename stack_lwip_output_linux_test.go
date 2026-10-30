@@ -77,10 +77,8 @@ func TestLWIPNativeGSOVirtioOutput(t *testing.T) {
 type lwipRejectGSOTestTun struct{ *lwipGROTestTun }
 
 func (*lwipRejectGSOTestTun) canWriteTCPGSO() bool { return true }
-func (*lwipRejectGSOTestTun) writeGSO(p []byte, offset int, options GSOOptions) error {
-	// Partial checksum encoding is allowed to modify this copy. The fallback
-	// must still use the original native bytes, not this failed write buffer.
-	clear(p[offset:])
+func (*lwipRejectGSOTestTun) writeGSO(p []byte, options GSOOptions) error {
+	// A rejecting device must leave the borrowed full-checksum packet intact.
 	return errLWIPGSOUnsupported
 }
 

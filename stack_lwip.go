@@ -33,6 +33,7 @@ type LWIP struct {
 	engine         *lwip.Stack
 	udpNat         *UDPNat
 	dispatcher     *ForwardDispatcher
+	dispatchStage  *ForwardStage
 	dispatchAccess sync.Mutex
 	tcpAccess      sync.RWMutex
 	tcpConns       map[flowKey]*lwipTCPConn
@@ -76,11 +77,12 @@ func (s *LWIP) Start() error {
 	if len(s.options.TunOptions.Inet6Address) > 0 {
 		a6 = s.options.TunOptions.Inet6Address[0].Addr()
 	}
-	s.udpNat = NewUDPNat(UDPNatOptions{
+	udpOptions := UDPNatOptions{
 		Handler: s.options.Handler, Prepare: s.preparePacketConnection, Timeout: s.options.UDPTimeout,
 		Shared: true, Mapping: s.options.UDPMapping, Filtering: s.options.UDPFiltering, MaxSize: s.options.UDPNATMax,
-		InterfaceFinder: s.options.InterfaceFinder, ExcludeInterface: []string{s.options.TunOptions.Name},
-	})
+		InterfaceFinder: s.options.InterfaceFinder,
+	}
+	s.udpNat = NewUDPNat(udpOptions)
 	if err := s.udpNat.Start(); err != nil {
 		return err
 	}
@@ -94,7 +96,8 @@ func (s *LWIP) Start() error {
 		return err
 	}
 	s.engine = engine
-	s.dispatcher = NewForwardDispatcher(s.options.Handler, s.writer, s.options.Logger, s.options.UDPTimeout, s.options.ICMPTimeout)
+	s.dispatcher = NewForwardDispatcher(s.options.Handler, s.writer, s.options.Logger, s.options.TunOptions.MTU, udpOptions, s.options.ICMPTimeout)
+	s.dispatchStage = s.dispatcher.NewStage(nil, s.resumeJudged)
 	go s.readLoop()
 	go s.writeLoop()
 	go func() { <-s.ctx.Done(); s.Close() }()
@@ -111,6 +114,7 @@ func (s *LWIP) ResetNetwork() {
 	s.engine.ResetUDP()
 	s.dispatchAccess.Lock()
 	s.dispatcher.ResetNetwork()
+	s.dispatchStage.Flush()
 	s.dispatchAccess.Unlock()
 }
 
@@ -168,8 +172,14 @@ func (s *LWIP) accept(c *lwip.Conn) {
 // Track the native connection lifetime for receive GSO eligibility instead.
 type lwipTCPConn struct {
 	*lwip.Conn
-	owner *LWIP
-	key   flowKey
+	owner         *LWIP
+	key           flowKey
+	readOptions   N.ReadWaitOptions
+	batchReader   lwipStreamBatchReader
+	readBatchSize int
+	readBuffers   [2]*buf.Buffer
+	readSlices    [2][]byte
+	readSizes     [2]int
 }
 
 func (c *lwipTCPConn) forget() {
@@ -230,12 +240,48 @@ func (s *LWIP) preparePacketConnection(source, destination M.Socksaddr, userData
 func (s *LWIP) routeDatagram(p *lwipPacket) bool {
 	// Share the existing per-flow verdict cache. Reassembled datagrams pass
 	// through the same DNS/reject/packet-forwarding path as unfragmented input.
-	raw := p.packet()
 	s.dispatchAccess.Lock()
-	handled := s.dispatcher.Dispatch(raw)
-	s.dispatcher.Flush()
+	if s.dispatchStage.resetSeen != s.dispatcher.resetGeneration.Load() {
+		s.dispatchStage.Flush()
+	}
+	// Most datagrams already acquired an accept verdict before native input.
+	// Consult it using the reassembled tuple, without rebuilding IP/UDP headers,
+	// copying the payload or calculating a checksum just to parse it again.
+	handled, cached := s.dispatchStage.dispatchLWIPDatagram(p.source, p.destination)
+	if !cached {
+		// A reassembled datagram may be the first complete packet for this
+		// tuple. The stage owns its snapshot while judging asynchronously.
+		// Accepted snapshots return through native input once, then hit the
+		// cached verdict on the next native read before reaching UDP NAT.
+		handled = s.dispatchStage.Dispatch(p.packet())
+	}
+	s.dispatchStage.Flush()
 	s.dispatchAccess.Unlock()
 	return handled
+}
+
+// Called under dispatchAccess, like Dispatch. Packet-forwarding/reject paths
+// still need a complete packet; DNS and new/expired flows retain the original
+// judgement path. The key includes the destination even for endpoint-independent
+// NAT, so a cached accepted destination cannot bypass another destination's policy.
+func (d *ForwardStage) dispatchLWIPDatagram(source, destination netip.AddrPort) (handled, cached bool) {
+	if d == nil || d.dispatcher.closed.Load() || d.resetSeen != d.dispatcher.resetGeneration.Load() {
+		return false, false
+	}
+	d.access.Lock()
+	defer d.access.Unlock()
+	entry := d.table[flowKey{protocol: uint8(header.UDPProtocolNumber), source: source, destination: destination}]
+	now := d.dispatcher.now()
+	if entry == nil || entryExpired(entry, now) {
+		return false, false
+	}
+	switch entry.action {
+	case ActionAccept, ActionDrop:
+		entry.deadline = now + int64(entry.idle)
+		return entry.action == ActionDrop, true
+	default:
+		return false, false
+	}
 }
 
 type lwipCapture struct{ packet []byte }
@@ -314,27 +360,47 @@ func (s *LWIP) process(packet []byte) {
 	}
 	if !parsed.fragment && parsed.protocol == uint8(header.TCPProtocolNumber) && parsed.hasFlow {
 		if parsed.ipVersion == 4 && slices.Contains(s.options.TunOptions.Inet4LoopbackAddress, destination) {
-			ip := parsed.network.(header.IPv4)
+			ip := header.IPv4(parsed.network)
 			rewriteIPv4TCP(ip, header.TCP(parsed.transport), false, destination, 0, false, parsed.source.Addr(), 0, false)
 			_ = s.writer.WriteReturnPackets([][]byte{packet})
 			return
 		}
 		if parsed.ipVersion == 6 && slices.Contains(s.options.TunOptions.Inet6LoopbackAddress, destination) {
-			ip := parsed.network.(header.IPv6)
+			ip := header.IPv6(parsed.network)
 			rewriteIPv6TCP(ip, header.TCP(parsed.transport), false, destination, 0, false, parsed.source.Addr(), 0, false)
 			_ = s.writer.WriteReturnPackets([][]byte{packet})
 			return
 		}
 	}
 	s.dispatchAccess.Lock()
-	handled := s.dispatcher.Dispatch(packet)
-	s.dispatcher.Flush()
+	handled := s.dispatchStage.Dispatch(packet)
+	s.dispatchStage.Flush()
 	s.dispatchAccess.Unlock()
 	if !handled {
-		if err := s.engine.Input(packet); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.options.Logger.Trace("lwIP input: ", err)
-		}
+		s.input(packet)
 	}
+}
+
+func (s *LWIP) input(packet []byte) {
+	if s.ctx.Err() != nil {
+		return
+	}
+	if err := s.engine.Input(packet); err != nil && !errors.Is(err, net.ErrClosed) {
+		s.options.Logger.Trace("lwIP input: ", err)
+	}
+}
+
+func (s *LWIP) resumeJudged() {
+	s.dispatchAccess.Lock()
+	defer s.dispatchAccess.Unlock()
+	if s.ctx.Err() != nil {
+		return
+	}
+	s.dispatchStage.ResumeJudged(func(packet []byte, meta ForwardFrameMeta) {
+		meta.completeChecksum(packet)
+		s.input(packet)
+	})
+	s.dispatchStage.Flush()
 }
 
 func (s *LWIP) readLoop() {
@@ -375,7 +441,7 @@ func (s *LWIP) readLoop() {
 	}
 	if t, ok := s.options.Tun.(DarwinTUN); ok && s.options.TunOptions.EXP_MultiPendingPackets {
 		for s.ctx.Err() == nil {
-			packets, err := t.BatchRead()
+			packets, err := t.BatchRead(0, 0)
 			for _, p := range packets {
 				s.process(p.Bytes())
 				p.Release()

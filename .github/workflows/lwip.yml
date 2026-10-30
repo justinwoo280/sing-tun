@@ -46,8 +46,22 @@ jobs:
         run: |
           CGO_ENABLED=0 go build .
           CGO_ENABLED=0 go build -tags with_gvisor .
-      - name: Test bundled-source CGO
-        run: CGO_ENABLED=1 go test -count=1 -tags with_lwip -run '^TestLWIP' .
+          CGO_ENABLED=0 go build -tags 'with_lwip with_purego with_gvisor' .
+      - name: Prepare pinned sources for source-CGO
+        run: |
+          go mod download github.com/justinwoo280/sing-lwip
+          directory=$(go list -m -f '{{.Dir}}' github.com/justinwoo280/sing-lwip)
+          source="$RUNNER_TEMP/lwip-source"
+          mkdir -p "$source"
+          cp -R "$directory/." "$source/"
+          chmod -R u+w "$source"
+          go -C "$source" run ./cmd/build-lwip sync-lwip
+          cp go.mod "$RUNNER_TEMP/lwip-source.mod"
+          cp go.sum "$RUNNER_TEMP/lwip-source.sum"
+          go mod edit "-modfile=$RUNNER_TEMP/lwip-source.mod" \
+            "-replace=github.com/justinwoo280/sing-lwip=$source"
+      - name: Test source-CGO
+        run: CGO_ENABLED=1 go test -mod=mod "-modfile=$RUNNER_TEMP/lwip-source.mod" -count=1 -tags with_lwip -run '^TestLWIP' .
       - name: Test pinned prebuilt CGO
         run: CGO_ENABLED=1 go test -count=1 -tags 'with_lwip with_lwip_prebuilt' -run '^TestLWIP' .
       - name: Test PureGo with the pinned shared library
@@ -62,7 +76,7 @@ jobs:
             go test -count=1 -tags 'with_lwip with_purego' -run '^TestLWIP' .
       - name: Race check
         if: runner.os == 'Linux'
-        run: CGO_ENABLED=1 go test -race -count=1 -tags with_lwip -run '^TestLWIP' .
+        run: CGO_ENABLED=1 go test -race -mod=mod "-modfile=$RUNNER_TEMP/lwip-source.mod" -count=1 -tags with_lwip -run '^TestLWIP' .
       - name: Check module graph
         run: |
           go mod verify

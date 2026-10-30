@@ -14,12 +14,13 @@ import (
 var errLWIPGSOUnsupported = errors.New("TUN TCP GSO unavailable")
 
 // Only an explicitly capable device enables native aggregates on its netif.
-// writeGSO is synchronous and must return errLWIPGSOUnsupported only when no
-// packet was accepted, allowing safe software segmentation of the same bytes.
+// writeGSO borrows an immutable packet synchronously and must return
+// errLWIPGSOUnsupported only when no packet was accepted, allowing safe software
+// segmentation of the same bytes.
 type lwipGSOWriter interface {
 	LinuxTUN
 	canWriteTCPGSO() bool
-	writeGSO(buffer []byte, offset int, options GSOOptions) error
+	writeGSO(packet []byte, options GSOOptions) error
 }
 
 func lwipOutputGSO(packet lwip.Packet) (GSOOptions, error) {
@@ -87,16 +88,7 @@ func (w *lwipWriteback) WriteNativePackets(packets []lwip.Packet) error {
 			return err
 		}
 		if t, ok := w.tun.(lwipGSOWriter); ok {
-			size := w.headroom + len(p.Data)
-			if cap(w.buffers[0]) < size {
-				w.buffers[0] = make([]byte, max(lwipWritebackBufferSize, size))
-			}
-			buffer := w.buffers[0][:size]
-			copy(buffer[w.headroom:], p.Data)
-			err = t.writeGSO(buffer, w.headroom, options)
-			if cap(buffer) > lwipWritebackBufferSize {
-				w.buffers[0] = nil
-			}
+			err = t.writeGSO(p.Data, options)
 			if err == nil {
 				continue
 			}
