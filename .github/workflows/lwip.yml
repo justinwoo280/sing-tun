@@ -48,6 +48,14 @@ jobs:
           CGO_ENABLED=0 go build -tags with_gvisor .
           CGO_ENABLED=0 go build -tags 'with_lwip with_purego with_gvisor' .
       - name: Prepare pinned sources for source-CGO
+        env:
+          # The pinned build tool predates its EOL fix. git archive otherwise
+          # inherits Windows' CRLF conversion and fails the locked tree hash.
+          GIT_CONFIG_COUNT: '2'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+          GIT_CONFIG_KEY_1: core.eol
+          GIT_CONFIG_VALUE_1: lf
         run: |
           go mod download github.com/justinwoo280/sing-lwip
           directory=$(go list -m -f '{{.Dir}}' github.com/justinwoo280/sing-lwip)
