@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,10 +40,11 @@ type NativeTun struct {
 	writeAccess         sync.Mutex
 	vnetHdr             bool
 	multiQueue          bool
-	writeBuffer         []byte
+	readBuffer          []byte
 	readRawConn         syscall.RawConn
-	pendingBuffer       []byte
-	pendingLength       int
+	pendingPayload      []byte
+	pendingOptions      GSOOptions
+	pendingSegment      int
 	vnetHdrWriteBuf     []byte
 	gsoToWrite          []int
 	tcpGROTable         *tcpGROTable
@@ -251,14 +253,8 @@ func (t *NativeTun) enableGSO() error {
 			t.gro.disableTCPGRO()
 			t.gro.disableUDPGRO()
 		}
-	} else {
-		err = setUDPOffload(t.tunFd)
-		if err != nil {
-			if t.options.Logger != nil {
-				t.options.Logger.Warn(E.Cause(err, "enable offload: set udp offload"))
-			}
-			t.gro.disableUDPGRO()
-		}
+	} else if setUDPOffload(t.tunFd) != nil {
+		t.gro.disableUDPGRO()
 	}
 	t.readRawConn, err = t.tunFile.SyscallConn()
 	if err != nil {
@@ -446,41 +442,12 @@ func (t *NativeTun) Close() error {
 }
 
 func (t *NativeTun) Read(p []byte) (n int, err error) {
-	if t.vnetHdr {
-		if t.writeBuffer == nil {
-			t.writeBuffer = make([]byte, virtioNetHdrLen+gsoMaxSize)
-		}
-		n, err = t.tunFile.Read(t.writeBuffer)
-		if err != nil {
-			if errors.Is(err, syscall.EBADFD) {
-				err = os.ErrClosed
-			}
-			return
-		}
-		var sizes [1]int
-		n, err = handleVirtioRead(t.writeBuffer[:n], [][]byte{p}, sizes[:], 0)
-		if err != nil {
-			return
-		}
-		if n == 0 {
-			return
-		}
-		n = sizes[0]
-		return
-	} else {
+	if !t.vnetHdr {
 		return t.tunFile.Read(p)
 	}
-}
-
-// handleVirtioRead splits in into bufs, leaving offset bytes at the front of
-// each buffer. It mutates sizes to reflect the size of each element of bufs,
-// and returns the number of packets read.
-func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, error) {
-	payload, options, err := parseVirtioRead(in)
-	if err != nil {
-		return 0, err
-	}
-	return GSOSplit(payload, options, bufs, sizes, offset)
+	var sizes [1]int
+	_, err = t.BatchRead([][]byte{p}, 0, sizes[:])
+	return sizes[0], err
 }
 
 func parseVirtioRead(in []byte) ([]byte, GSOOptions, error) {
@@ -518,14 +485,6 @@ func parseVirtioRead(in []byte) ([]byte, GSOOptions, error) {
 	return in, options, nil
 }
 
-func gsoSegmentCount(payload []byte, options GSOOptions) int {
-	dataLength := len(payload) - int(options.HdrLen)
-	if options.GSOType == GSONone || options.GSOSize == 0 || dataLength < int(options.GSOSize) {
-		return 1
-	}
-	return (dataLength + int(options.GSOSize) - 1) / int(options.GSOSize)
-}
-
 func (t *NativeTun) Write(p []byte) (n int, err error) {
 	if t.vnetHdr {
 		_, err = t.BatchWrite([][]byte{p}, virtioNetHdrLen)
@@ -561,55 +520,40 @@ func (t *NativeTun) BatchSize() int {
 func (t *NativeTun) BatchRead(buffers [][]byte, offset int, readN []int) (int, error) {
 	t.readAccess.Lock()
 	defer t.readAccess.Unlock()
-	var used int
-	if t.pendingLength > 0 {
-		pendingLength := t.pendingLength
-		t.pendingLength = 0
-		count, err := handleVirtioRead(t.pendingBuffer[:pendingLength], buffers, readN, offset)
-		if err != nil {
-			return count, err
-		}
-		used = count
+	if t.readBuffer == nil {
+		t.readBuffer = make([]byte, virtioNetHdrLen+gsoMaxSize)
 	}
+	var used int
 	for used < len(buffers) {
-		if t.writeBuffer == nil {
-			t.writeBuffer = make([]byte, virtioNetHdrLen+gsoMaxSize)
-		}
-		var (
-			readLength int
-			err        error
-		)
-		if used == 0 {
-			readLength, err = t.tunFile.Read(t.writeBuffer)
+		if t.pendingPayload == nil {
+			var (
+				readLength int
+				err        error
+			)
+			if used == 0 {
+				readLength, err = t.tunFile.Read(t.readBuffer)
+				if err != nil {
+					return 0, err
+				}
+			} else {
+				readLength, err = t.readNonblocking(t.readBuffer)
+				if err != nil || readLength == 0 {
+					break
+				}
+			}
+			t.pendingPayload, t.pendingOptions, err = parseVirtioRead(t.readBuffer[:readLength])
 			if err != nil {
-				return 0, err
+				continue
 			}
-		} else {
-			readLength, err = t.readNonblocking(t.writeBuffer)
-			if err != nil || readLength == 0 {
-				break
-			}
+			t.pendingSegment = 0
 		}
-		payload, options, parseErr := parseVirtioRead(t.writeBuffer[:readLength])
-		if parseErr != nil {
-			if used > 0 {
-				break
-			}
-			return 0, parseErr
-		}
-		if used > 0 && gsoSegmentCount(payload, options) > len(buffers)-used {
-			t.writeBuffer, t.pendingBuffer = t.pendingBuffer, t.writeBuffer
-			t.pendingLength = readLength
+		count, err := GSOSplit(t.pendingPayload, t.pendingOptions, t.pendingSegment, buffers[used:], readN[used:], offset)
+		used += count
+		if errors.Is(err, ErrTooManySegments) {
+			t.pendingSegment += count
 			break
 		}
-		count, splitErr := GSOSplit(payload, options, buffers[used:], readN[used:], offset)
-		if splitErr != nil {
-			if used > 0 {
-				break
-			}
-			return count, splitErr
-		}
-		used += count
+		t.pendingPayload = nil
 	}
 	return used, nil
 }
@@ -808,11 +752,15 @@ func (t *NativeTun) rules() []*netlink.Rule {
 	priority6 := priority
 
 	if t.options.AutoRedirectMarkMode {
-		inputMark := effectiveMark(t.options.AutoRedirectInputMark, DefaultAutoRedirectInputMark, DefaultAutoRedirectInputMarkAndroid)
-		outputMark := effectiveMark(t.options.AutoRedirectOutputMark, DefaultAutoRedirectOutputMark, DefaultAutoRedirectOutputMarkAndroid)
-		resetMark := effectiveMark(t.options.AutoRedirectResetMark, DefaultAutoRedirectResetMark, DefaultAutoRedirectResetMarkAndroid)
-		tproxyMark := effectiveMark(t.options.AutoRedirectTProxyMark, DefaultAutoRedirectTProxyMark, DefaultAutoRedirectTProxyMarkAndroid)
+		inputMark := effectiveMark(t.options.AutoRedirectInputMark, DefaultAutoRedirectInputMark)
+		outputMark := effectiveMark(t.options.AutoRedirectOutputMark, DefaultAutoRedirectOutputMark)
+		resetMark := effectiveMark(t.options.AutoRedirectResetMark, DefaultAutoRedirectResetMark)
+		tproxyMark := effectiveMark(t.options.AutoRedirectTProxyMark, DefaultAutoRedirectTProxyMark)
 		markMask := int(inputMark | outputMark | resetMark | tproxyMark)
+		inputMarkMask := markMask
+		if t.options.AutoRedirectInputMarkMask != 0 {
+			inputMarkMask = int(t.options.AutoRedirectInputMarkMask)
+		}
 		if p4 {
 			it = netlink.NewRule()
 			it.Priority = priority
@@ -828,7 +776,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.Priority = priority
 			it.Mark = inputMark
 			it.MarkSet = true
-			it.Mask = markMask
+			it.Mask = inputMarkMask
 			it.Table = t.options.IPRoute2TableIndex
 			it.Family = unix.AF_INET
 			rules = append(rules, it)
@@ -854,7 +802,7 @@ func (t *NativeTun) rules() []*netlink.Rule {
 			it.Priority = priority6
 			it.Mark = inputMark
 			it.MarkSet = true
-			it.Mask = markMask
+			it.Mask = inputMarkMask
 			it.Table = t.options.IPRoute2TableIndex
 			it.Family = unix.AF_INET6
 			rules = append(rules, it)
@@ -1209,10 +1157,28 @@ func (t *NativeTun) setRoute(tunLink netlink.Link) error {
 }
 
 func (t *NativeTun) setRules() error {
+	var uidRangeChecked bool
 	for i, rule := range t.rules() {
 		err := netlink.RuleAdd(rule)
 		if err != nil {
+			if rule.Type == unix.FR_ACT_UNREACHABLE && errors.Is(err, unix.EAFNOSUPPORT) {
+				socketFd, socketErr := unix.Socket(rule.Family, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+				if socketErr == nil {
+					unix.Close(socketFd)
+				} else if errors.Is(socketErr, unix.EAFNOSUPPORT) {
+					continue
+				}
+			}
 			return E.Cause(err, "add rule ", i, "/", len(t.rules()))
+		}
+		if rule.UIDRange != nil && !uidRangeChecked {
+			uidRangeChecked = true
+			installedRules, listErr := netlink.RuleListFiltered(rule.Family, &netlink.Rule{Priority: rule.Priority}, netlink.RT_FILTER_PRIORITY)
+			if listErr == nil && !slices.ContainsFunc(installedRules, func(it netlink.Rule) bool {
+				return it.UIDRange != nil
+			}) {
+				return E.New("uid range rules are not supported by the kernel (Linux 4.10 or later is required)")
+			}
 		}
 	}
 	return nil
@@ -1260,10 +1226,15 @@ func (t *NativeTun) unsetRules() error {
 		for _, rule := range ruleList {
 			ruleStart := t.options.IPRoute2RuleIndex
 			ruleEnd := ruleStart + 10
-			if rule.Priority >= ruleStart && rule.Priority <= ruleEnd || (t.options.AutoRedirectMarkMode && rule.Priority == t.options.IPRoute2AutoRedirectFallbackRuleIndex) {
+			fallbackRule := t.options.AutoRedirectMarkMode && rule.Priority == t.options.IPRoute2AutoRedirectFallbackRuleIndex &&
+				rule.Invert && rule.Table == t.options.IPRoute2TableIndex
+			if rule.Priority >= ruleStart && rule.Priority <= ruleEnd || fallbackRule {
 				ruleToDel := netlink.NewRule()
 				ruleToDel.Family = rule.Family
 				ruleToDel.Priority = rule.Priority
+				if fallbackRule {
+					ruleToDel.Table = rule.Table
+				}
 				err = netlink.RuleDel(ruleToDel)
 				if err != nil {
 					return E.Cause(err, "unset rule ", rule.Priority, " for ", rule.Family)
@@ -1319,6 +1290,7 @@ func (t *NativeTun) setSearchDomainForSystemdResolved() error {
 		return err
 	}
 	go func() {
+		_ = shell.Exec(ctlPath, "dnsovertls", t.options.Name, "no").Run()
 		_ = shell.Exec(ctlPath, "domain", t.options.Name, "~.").Run()
 		_ = shell.Exec(ctlPath, "default-route", t.options.Name, "true").Run()
 		_ = shell.Exec(ctlPath, append([]string{"dns", t.options.Name}, common.Map(dnsAddress, netip.Addr.String)...)...).Run()

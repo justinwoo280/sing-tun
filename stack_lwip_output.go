@@ -104,7 +104,7 @@ func (w *lwipWriteback) WriteNativePackets(packets []lwip.Packet) error {
 		for i := range segments {
 			segments[i] = make([]byte, int(options.HdrLen)+int(options.GSOSize))
 		}
-		count, err = GSOSplit(p.Data, options, segments, sizes, 0)
+		count, err = GSOSplit(p.Data, options, 0, segments, sizes, 0)
 		if err != nil {
 			return err
 		}

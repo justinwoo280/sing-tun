@@ -28,7 +28,7 @@ type nfqueueHandler struct {
 	outputMark     uint32
 	resetMark      uint32
 	tproxyMark     uint32
-	markMask       uint32
+	markMask       func(mark uint32) uint32
 	repeatOnAccept bool
 	closed         atomic.Bool
 	judgingAccess  sync.Mutex
@@ -64,10 +64,7 @@ func (h *nfqueueHandler) acceptVerdict(packet preMatchPacket) (verdict int, mark
 func (h *nfqueueHandler) setVerdict(queued queuedPacket, verdict int, mark uint32) {
 	var err error
 	if mark != 0 {
-		if h.markMask != 0 {
-			mark = queued.mark&^h.markMask | mark
-		}
-		err = h.nfq.SetVerdictWithOption(queued.id, verdict, nfqueue.WithMark(mark))
+		err = h.nfq.SetVerdictWithOption(queued.id, verdict, nfqueue.WithMark(queued.mark&^h.markMask(mark)|mark))
 	} else {
 		err = h.nfq.SetVerdict(queued.id, verdict)
 	}
@@ -172,10 +169,6 @@ func parsePreMatchPacket(packet []byte) (preMatchPacket, bool) {
 			return preMatchPacket{}, false
 		}
 		tcpHdr := header.TCP(transport)
-		flags := tcpHdr.Flags()
-		if !flags.Contains(header.TCPFlagSyn) || flags.Contains(header.TCPFlagAck) {
-			return preMatchPacket{}, false
-		}
 		parsed.source = netip.AddrPortFrom(source, tcpHdr.SourcePort())
 		parsed.destination = netip.AddrPortFrom(destination, tcpHdr.DestinationPort())
 	case uint8(header.UDPProtocolNumber):

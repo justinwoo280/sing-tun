@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -431,33 +432,34 @@ func (s *kernelSocket) Close() error {
 func (f *kernelStackFixture) splicePair(t *testing.T, ipv6 bool) (*net.TCPConn, *net.TCPConn, *atomic.Int64, *atomic.Int64) {
 	t.Helper()
 	client, goConn := f.pair(t, ipv6)
-	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	// Configure small buffers before the loopback handshake too. Reducing
+	// them only after accept retains the window scale negotiated for much
+	// larger buffers and makes this test measure kernel persist delays.
+	var control func(string, string, syscall.RawConn) error
+	if f.upstreamSocketBuffer > 0 {
+		control = func(_, _ string, raw syscall.RawConn) error {
+			var optionErr error
+			err := raw.Control(func(fd uintptr) { optionErr = kernelSetSocketBuffers(fd, f.upstreamSocketBuffer) })
+			return E.Errors(err, optionErr)
+		}
+	}
+	listener, err := (&net.ListenConfig{Control: control}).Listen(context.Background(), "tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	remote, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+	rawRemote, err := (&net.Dialer{Control: control}).DialContext(context.Background(), "tcp4", listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
+	remote := rawRemote.(*net.TCPConn)
 	t.Cleanup(func() { remote.Close() })
-	peer, err := listener.AcceptTCP()
+	rawPeer, err := listener.Accept()
 	if err != nil {
 		t.Fatal(err)
 	}
+	peer := rawPeer.(*net.TCPConn)
 	t.Cleanup(func() { peer.Close() })
-	if f.upstreamSocketBuffer > 0 {
-		for _, socket := range []*net.TCPConn{remote, peer} {
-			err = socket.SetReadBuffer(f.upstreamSocketBuffer)
-			if err != nil {
-				t.Fatal(err)
-			}
-			err = socket.SetWriteBuffer(f.upstreamSocketBuffer)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
 	peer.SetDeadline(time.Now().Add(10 * time.Second))
 	upload := new(atomic.Int64)
 	download := new(atomic.Int64)

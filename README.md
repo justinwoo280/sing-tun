@@ -8,7 +8,10 @@ For Linux, Windows, macOS and iOS.
 
 The [`lwip` branch](https://github.com/justinwoo280/sing-tun/tree/lwip) adds an optional
 [sing-lwip](https://github.com/justinwoo280/sing-lwip) backend. It is based on upstream
-`dev` at [`5b0a1a7`](https://github.com/SagerNet/sing-tun/commit/5b0a1a7a394ed49d1a1adab3877284b86a8af94e).
+`dev` at [`1a13df1`](https://github.com/SagerNet/sing-tun/commit/1a13df1ac21f721794985aab631a56cf96683fef),
+which includes `main` through `adc31e2`. The previous dev snapshot was `5b0a1a7`;
+upstream rebased that history, so this integration replays the fork delta while
+retaining both published histories as merge parents.
 The upstream `main` and `dev` branches serve as synchronization references; fork
 integration commits live on `lwip`.
 
@@ -25,6 +28,11 @@ integration commits live on `lwip`.
 The new Go stack, gVisor and lwIP are independent selectable backends. Enabling
 `with_lwip` keeps `go` as the default. Applications also need to expose the
 corresponding names in their configuration schema.
+
+The Go stack's default buffer profile remains Full on non-iOS platforms and
+Compact on iOS. Embeddings can explicitly select `StackOptions.BufferProfile`.
+The pinned `sing` dev revision supplies the Go stack's packet-offload and
+memory-limit APIs, in addition to the fixes on sing's main line.
 
 This module requires Go 1.25 or newer and retains the module path
 `github.com/sagernet/sing-tun`. Applications select the fork using a pinned Go module
@@ -85,6 +93,14 @@ The [lwIP workflow](.github/workflows/lwip.yml) checks prepared-source CGO, preb
 and PureGo with the pinned published dependency, plus default/gVisor builds. Backend
 regressions use in-memory packets and cover policy handling, fragmentation, GSO,
 checksums, buffer reuse and fallback paths.
+
+The [general test workflow](.github/workflows/test.yml) also runs on `lwip`,
+including the Go stack's kernel/network integration tests. The native lwIP
+archives are pinned to the same published revision used by the consumers.
+The Linux lwIP jobs check IPv4/IPv6 TCP and UDP echo through all five
+selectable backends in an isolated network namespace. Additional regressions
+cover partial GSO reads switching between BatchRead and lwIP, and fragmented
+DNS retaining its original hijack verdict after native reassembly.
 
 To update the integration, fetch upstream `dev`, merge it into `lwip`, review changes
 to the TUN/forwarding interfaces, and run the backend checks before publishing a new

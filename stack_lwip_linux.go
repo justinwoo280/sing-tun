@@ -22,16 +22,35 @@ func (t *NativeTun) readGSO(buffer []byte) ([]byte, GSOOptions, error) {
 	if len(buffer) < gsoMaxSize+virtioNetHdrLen {
 		return nil, GSOOptions{}, io.ErrShortBuffer
 	}
-	var n int
-	if t.pendingLength > 0 {
-		n = copy(buffer, t.pendingBuffer[:t.pendingLength])
-		t.pendingLength = 0
-	} else {
-		var err error
-		n, err = t.tunFile.Read(buffer)
+	if t.pendingPayload != nil {
+		if t.pendingSegment == 0 {
+			// Hand an untouched aggregate to lwIP, but never expose NativeTun's
+			// reusable read buffer after releasing readAccess.
+			n := copy(buffer, t.pendingPayload)
+			options := t.pendingOptions
+			t.pendingPayload = nil
+			return buffer[:n], options, nil
+		}
+		// BatchRead may already have delivered a prefix of this aggregate.
+		// Drain only its remaining segments, retaining the original headers
+		// and cursor until the last segment (including FIN/PSH) is delivered.
+		var sizes [1]int
+		n, err := GSOSplit(t.pendingPayload, t.pendingOptions, t.pendingSegment, [][]byte{buffer}, sizes[:], 0)
+		if errors.Is(err, ErrTooManySegments) {
+			t.pendingSegment += n
+			err = nil
+		} else {
+			t.pendingPayload = nil
+			t.pendingSegment = 0
+		}
 		if err != nil {
 			return nil, GSOOptions{}, err
 		}
+		return buffer[:sizes[0]], GSOOptions{}, nil
+	}
+	n, err := t.tunFile.Read(buffer)
+	if err != nil {
+		return nil, GSOOptions{}, err
 	}
 	return parseVirtioRead(buffer[:n])
 }

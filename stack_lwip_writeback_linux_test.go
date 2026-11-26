@@ -100,7 +100,7 @@ func lwipGROTestSplit(t *testing.T, packets []lwipGSOTestPacket) [][]byte {
 		for i := range buffers {
 			buffers[i] = make([]byte, 65536)
 		}
-		n, err := GSOSplit(p.packet, p.options, buffers, sizes, 0)
+		n, err := GSOSplit(p.packet, p.options, 0, buffers, sizes, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

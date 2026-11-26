@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lwip "github.com/justinwoo280/sing-lwip"
@@ -247,13 +248,22 @@ func (s *LWIP) routeDatagram(p *lwipPacket) bool {
 	// Most datagrams already acquired an accept verdict before native input.
 	// Consult it using the reassembled tuple, without rebuilding IP/UDP headers,
 	// copying the payload or calculating a checksum just to parse it again.
-	handled, cached := s.dispatchStage.dispatchLWIPDatagram(p.source, p.destination)
-	if !cached {
+	action, cached := s.dispatchStage.dispatchLWIPDatagram(p.source, p.destination)
+	handled := cached && action == ActionDrop
+	if cached && action == ActionHijackDNS {
+		// ForwardStage accepts fragments for local reassembly while retaining
+		// the DNS verdict. Apply it to the complete datagram, not the prefix
+		// seen during the initial asynchronous lookup.
+		s.dispatcher.handler.NewDNSPacket(p.payload, M.SocksaddrFromNetIP(p.source), M.SocksaddrFromNetIP(p.destination), &dnsResponseWriter{
+			writeback: s.dispatcher.writeback, identification: &s.dispatcher.identification, source: p.source,
+		})
+		handled = true
+	} else if !cached {
 		// A reassembled datagram may be the first complete packet for this
 		// tuple. The stage owns its snapshot while judging asynchronously.
 		// Accepted snapshots return through native input once, then hit the
 		// cached verdict on the next native read before reaching UDP NAT.
-		handled = s.dispatchStage.Dispatch(p.packet())
+		handled = s.dispatchStage.Dispatch(p.packet(&s.dispatcher.identification))
 	}
 	s.dispatchStage.Flush()
 	s.dispatchAccess.Unlock()
@@ -261,26 +271,29 @@ func (s *LWIP) routeDatagram(p *lwipPacket) bool {
 }
 
 // Called under dispatchAccess, like Dispatch. Packet-forwarding/reject paths
-// still need a complete packet; DNS and new/expired flows retain the original
+// still need a complete packet; new/expired flows retain the original
 // judgement path. The key includes the destination even for endpoint-independent
 // NAT, so a cached accepted destination cannot bypass another destination's policy.
-func (d *ForwardStage) dispatchLWIPDatagram(source, destination netip.AddrPort) (handled, cached bool) {
+func (d *ForwardStage) dispatchLWIPDatagram(source, destination netip.AddrPort) (action FlowAction, cached bool) {
 	if d == nil || d.dispatcher.closed.Load() || d.resetSeen != d.dispatcher.resetGeneration.Load() {
-		return false, false
+		return 0, false
 	}
 	d.access.Lock()
 	defer d.access.Unlock()
 	entry := d.table[flowKey{protocol: uint8(header.UDPProtocolNumber), source: source, destination: destination}]
 	now := d.dispatcher.now()
 	if entry == nil || entryExpired(entry, now) {
-		return false, false
+		return 0, false
 	}
 	switch entry.action {
 	case ActionAccept, ActionDrop:
 		entry.deadline = now + int64(entry.idle)
-		return entry.action == ActionDrop, true
+		if entry.action == ActionAccept && entry.verdict.Action == ActionHijackDNS {
+			return ActionHijackDNS, true
+		}
+		return entry.action, true
 	default:
-		return false, false
+		return 0, false
 	}
 }
 
@@ -293,15 +306,15 @@ func (w *lwipCapture) WriteReturnPackets(p [][]byte) error {
 	}
 	return nil
 }
-func (p *lwipPacket) packet() []byte {
+func (p *lwipPacket) packet(identification *atomic.Uint32) []byte {
 	// Reverse the reply-oriented arguments of the shared UDP/IP encoder.
 	w := &lwipCapture{}
-	encoder := dnsResponseWriter{writeback: w, source: p.destination}
+	encoder := dnsResponseWriter{writeback: w, identification: identification, source: p.destination}
 	_ = encoder.WritePacket(buf.As(p.payload), M.SocksaddrFromNetIP(p.source))
 	return w.packet
 }
 func (s *LWIP) rejectUDP(p *lwipPacket) {
-	if parsed, ok := parseForwardPacket(p.packet()); ok {
+	if parsed, ok := parseForwardPacket(p.packet(&s.dispatcher.identification)); ok {
 		if reply, ok := buildReject(&parsed, 0); ok {
 			_ = s.writer.WriteReturnPackets([][]byte{reply})
 		}

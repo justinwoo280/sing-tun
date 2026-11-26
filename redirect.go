@@ -7,20 +7,16 @@ import (
 
 	"github.com/sagernet/sing/common/control"
 	"github.com/sagernet/sing/common/logger"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
 
 const (
-	DefaultAutoRedirectInputMark  = 0x2023
-	DefaultAutoRedirectOutputMark = 0x2024
-	DefaultAutoRedirectResetMark  = 0x2025
-	DefaultAutoRedirectTProxyMark = 0x2026
+	DefaultAutoRedirectInputMark  = 0x04000000
+	DefaultAutoRedirectOutputMark = 0x08000000
+	DefaultAutoRedirectResetMark  = 0x10000000
+	DefaultAutoRedirectTProxyMark = 0x0c000000
 	DefaultAutoRedirectNFQueue    = 100
-
-	DefaultAutoRedirectInputMarkAndroid  = 0x400000
-	DefaultAutoRedirectOutputMarkAndroid = 0x200000
-	DefaultAutoRedirectResetMarkAndroid  = 0x600000
-	DefaultAutoRedirectTProxyMarkAndroid = 0x800000
 )
 
 type AutoRedirect interface {
@@ -31,6 +27,7 @@ type AutoRedirect interface {
 
 type AutoRedirectHandler interface {
 	JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) FlowVerdict
+	NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter)
 	N.TCPConnectionHandlerEx
 }
 
@@ -55,15 +52,9 @@ type AutoRedirectOptions struct {
 // mirrored into the connmark, where netd's StrictController owns bits 24-25.
 const androidReservedMarkMask = 0xE31FFFFF
 
-func effectiveMark(value uint32, defaultValue uint32, androidDefaultValue uint32) uint32 {
-	if runtime.GOOS == "android" {
-		if value != 0 && value&androidReservedMarkMask == 0 {
-			return value
-		}
-		return androidDefaultValue
+func effectiveMark(value uint32, defaultValue uint32) uint32 {
+	if value == 0 || runtime.GOOS == "android" && value&androidReservedMarkMask != 0 {
+		return defaultValue
 	}
-	if value != 0 {
-		return value
-	}
-	return defaultValue
+	return value
 }

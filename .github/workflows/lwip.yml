@@ -85,6 +85,16 @@ jobs:
       - name: Race check
         if: runner.os == 'Linux'
         run: CGO_ENABLED=1 go test -race -mod=mod "-modfile=$RUNNER_TEMP/lwip-source.mod" -count=1 -tags with_lwip -run '^TestLWIP' .
+      - name: Kernel echo for all selectable stacks
+        if: runner.os == 'Linux'
+        run: |
+          CGO_ENABLED=1 go test -mod=readonly -c -o "$RUNNER_TEMP/tun-backends.test" \
+            -tags 'with_lwip with_lwip_prebuilt with_gvisor' .
+          sudo unshare --net sh -ec '
+            ip link set lo up
+            sysctl -q -w net.ipv4.ip_forward=1
+            exec "$1" -test.run "^TestSelectableBackendsKernelEcho$" -test.v -test.timeout 1m
+          ' sh "$RUNNER_TEMP/tun-backends.test"
       - name: Check module graph
         run: |
           go mod verify

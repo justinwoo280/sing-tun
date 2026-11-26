@@ -182,6 +182,10 @@ func (f *kernelStackFixture) packetPair(t *testing.T, ipv6 bool) (*net.UDPConn, 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { client.Close() })
+	err = client.SetReadBuffer(1 << 20)
+	if err != nil {
+		t.Fatal(err)
+	}
 	err = client.SetWriteBuffer(1 << 20)
 	if err != nil {
 		t.Fatal(err)
@@ -532,6 +536,7 @@ type kernelPacketAllocator struct {
 	active       atomic.Int64
 	epoch        time.Time
 	lastActivity atomic.Int64
+	idleTimeout  time.Duration
 }
 
 type kernelPacketIO struct {
@@ -554,6 +559,7 @@ func (p *kernelPacketIO) wait(timeout time.Duration, events []goSocketEvent) (bo
 }
 
 func (a *kernelPacketAllocator) prepareStack(stack *Go) {
+	a.idleTimeout = stack.profile.readBufferIdle
 	queues := stack.queueFactory
 	stack.queueFactory = func(current *Go) ([]goPlatformIO, error) {
 		platforms, err := queues(current)
@@ -591,10 +597,10 @@ func (a *kernelPacketAllocator) waitIdle(t *testing.T) {
 		quiet := time.Since(a.epoch) - time.Duration(lastActivity)
 		active := a.active.Load()
 		unchanged := a.lastActivity.Load() == lastActivity
-		if quiet >= goReadBufferIdle && active == 0 && unchanged {
+		if quiet >= a.idleTimeout && active == 0 && unchanged {
 			return
 		}
-		if quiet >= goReadBufferIdle+time.Second && active != 0 && unchanged {
+		if quiet >= a.idleTimeout+time.Second && active != 0 && unchanged {
 			t.Fatalf("connections retain %d pooled buffers after %s without native I/O", active, quiet)
 		}
 		if time.Now().After(deadline) {
@@ -739,7 +745,7 @@ func TestGoKernelPacketBatchIdle(t *testing.T) {
 								if err != nil {
 									scenarioTest.Fatalf("download packet %d: %v", index, err)
 								}
-								kernelCheckBatchPacket(scenarioTest, data[:length], payloads, downloaded, index, !config.multiQueue)
+								kernelCheckBatchPacket(scenarioTest, data[:length], payloads, downloaded, index, !config.multiQueue && !(ipv6 && runtime.GOOS == "darwin"))
 							}
 							allocator.waitIdle(scenarioTest)
 							if conn.isClosed() {

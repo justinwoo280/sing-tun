@@ -98,7 +98,7 @@ func (s *LWIP) readGSOLoop(t lwipGSOReader) {
 		// the next read, so the original TUN buffer can be used directly.
 		if options.GSOType == GSONone {
 			var size [1]int
-			_, err = GSOSplit(packet, options, [][]byte{packet}, size[:], 0)
+			_, err = GSOSplit(packet, options, 0, [][]byte{packet}, size[:], 0)
 			if err == nil {
 				s.process(packet)
 			}
@@ -117,7 +117,7 @@ func (s *LWIP) readGSOLoop(t lwipGSOReader) {
 				}
 			}
 			var n int
-			n, err = GSOSplit(packet, options, segments[:count], sizes[:count], 0)
+			n, err = GSOSplit(packet, options, 0, segments[:count], sizes[:count], 0)
 			for i := range n {
 				s.process(segments[i][:sizes[i]])
 			}

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -53,6 +54,8 @@ func (t *lwipTestTun) Close() error { t.once.Do(func() { close(t.done) }); retur
 
 type lwipTestHandler struct{}
 
+var lwipTestPacketID atomic.Uint32
+
 func (*lwipTestHandler) JudgeFlow(_ uint8, _ netip.AddrPort, destination netip.AddrPort, _ []byte) FlowVerdict {
 	switch destination.Port() {
 	case 53:
@@ -86,7 +89,7 @@ func (*lwipTestHandler) NewPacketConnectionEx(_ context.Context, c N.PacketConn,
 }
 func lwipTestPacket(port uint16, payload []byte) []byte {
 	capture := &lwipCapture{}
-	writer := dnsResponseWriter{writeback: capture, source: netip.AddrPortFrom(netip.MustParseAddr("198.18.0.20"), port)}
+	writer := dnsResponseWriter{writeback: capture, identification: &lwipTestPacketID, source: netip.AddrPortFrom(netip.MustParseAddr("198.18.0.20"), port)}
 	_ = writer.WritePacket(buf.As(payload), M.ParseSocksaddr("198.18.0.10:40000"))
 	return capture.packet
 }
