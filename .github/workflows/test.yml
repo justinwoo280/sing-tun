@@ -52,6 +52,9 @@ jobs:
         env:
           TEST_FLAGS: ${{ runner.os != 'Windows' && '-exec sudo' || '' }}
         run: make test
+      - name: Repeat Windows UDP mapping after interface readiness
+        if: runner.os == 'Windows'
+        run: go test -mod=readonly -run '^TestGoKernelPacketMapping$' -count 5 -v -timeout 5m .
       - name: Diagnose Windows UDP mapping failure
         if: failure() && runner.os == 'Windows'
         shell: pwsh
