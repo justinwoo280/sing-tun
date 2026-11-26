@@ -65,14 +65,14 @@ jobs:
           $exe = Join-Path $evidence 'mapping.test.exe'
           go test -mod=readonly -c -o $exe .
           if ($LASTEXITCODE -ne 0) { throw 'cannot build UDP diagnostic binary' }
-          & $exe -test.run '^TestGoKernelPacketMapping$' -test.count 3 -test.v -test.timeout 2m *> "$evidence/fork-program-rule.log"
+          & $exe '-test.run=^TestGoKernelPacketMapping$' '-test.count=3' '-test.v' '-test.timeout=2m' *> "$evidence/fork-program-rule.log"
           "fork_program_rule=$LASTEXITCODE" | Out-File "$evidence/results.txt"
           # Keep the application rule and add a rule scoped to the synthetic
           # TUN ranges, to distinguish WFP filtering from the stack's NAT policy.
           netsh advfirewall firewall add rule name=sing-tun-udp-diagnostic dir=in action=allow protocol=UDP remoteip=198.18.0.0/15,fd73:ab91::/32 profile=any
           if ($LASTEXITCODE -ne 0) { throw 'cannot install scoped diagnostic rule' }
           try {
-            & $exe -test.run '^TestGoKernelPacketMapping$' -test.count 3 -test.v -test.timeout 2m *> "$evidence/fork-scoped-rule.log"
+            & $exe '-test.run=^TestGoKernelPacketMapping$' '-test.count=3' '-test.v' '-test.timeout=2m' *> "$evidence/fork-scoped-rule.log"
             "fork_scoped_rule=$LASTEXITCODE" | Out-File -Append "$evidence/results.txt"
           } finally {
             netsh advfirewall firewall delete rule name=sing-tun-udp-diagnostic

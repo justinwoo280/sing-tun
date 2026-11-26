@@ -31,7 +31,7 @@ jobs:
           - {runner: ubuntu-24.04, target: linux_amd64_gnu, library: libsing-lwip.so, go: '1.26.x'}
           - {runner: ubuntu-24.04-arm, target: linux_arm64_gnu, library: libsing-lwip.so, go: '1.26.x'}
           - {runner: macos-15-intel, target: darwin_amd64, library: libsing-lwip.dylib, go: '1.26.x'}
-          - {runner: macos-15, target: darwin_arm64, library: libsing-lwip.dylib, go: '1.26.x'}
+          - {runner: macos-26, target: darwin_arm64, library: libsing-lwip.dylib, go: '1.26.x'}
           - {runner: windows-2022, target: windows_amd64, library: sing-lwip.dll, go: '1.26.x'}
     defaults:
       run:
