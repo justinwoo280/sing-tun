@@ -58,6 +58,10 @@ jobs:
         run: |
           $evidence = Join-Path $env:RUNNER_TEMP 'udp-mapping-diagnostics'
           New-Item -ItemType Directory -Force $evidence | Out-Null
+          $captureStarted = Get-Date
+          auditpol /set '/subcategory:Filtering Platform Packet Drop' /failure:enable
+          auditpol /set '/subcategory:Filtering Platform Connection' /failure:enable
+          netsh wfp set options netevents=on
           go version | Out-File "$evidence/toolchain.txt"
           Get-NetFirewallProfile | Format-List * | Out-File "$evidence/firewall-profiles.txt"
           Get-NetFirewallRule -DisplayName sing-tun-test | Format-List * | Out-File "$evidence/firewall-rule.txt"
@@ -84,9 +88,14 @@ jobs:
           try {
             go test "-modfile=$modfile" -mod=readonly -run '^TestGoKernelPacketMapping$' -count 3 -v -timeout 2m . *> "$evidence/upstream-same-dependencies.log"
             "upstream_same_dependencies=$LASTEXITCODE" | Out-File -Append "$evidence/results.txt"
+            go test -mod=readonly -run '^TestGoKernelPacketMapping$' -count 3 -v -timeout 2m . *> "$evidence/upstream-original-dependencies.log"
+            "upstream_original_dependencies=$LASTEXITCODE" | Out-File -Append "$evidence/results.txt"
           } finally {
             Pop-Location
           }
+          netsh wfp show netevents "file=$evidence/wfp-events.xml"
+          netsh wfp show filters "file=$evidence/wfp-filters.xml"
+          Get-WinEvent -FilterHashtable @{LogName='Security'; Id=5152,5157; StartTime=$captureStarted} -ErrorAction SilentlyContinue | Format-List TimeCreated,Id,Message | Out-File "$evidence/wfp-drops.txt"
           Get-Content "$evidence/results.txt"
           # The preceding Test step remains failed; these runs only add evidence.
           exit 0
