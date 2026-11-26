@@ -1,6 +1,7 @@
 name: test
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -51,6 +52,50 @@ jobs:
         env:
           TEST_FLAGS: ${{ runner.os != 'Windows' && '-exec sudo' || '' }}
         run: make test
+      - name: Diagnose Windows UDP mapping failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP 'udp-mapping-diagnostics'
+          New-Item -ItemType Directory -Force $evidence | Out-Null
+          go version | Out-File "$evidence/toolchain.txt"
+          Get-NetFirewallProfile | Format-List * | Out-File "$evidence/firewall-profiles.txt"
+          Get-NetFirewallRule -DisplayName sing-tun-test | Format-List * | Out-File "$evidence/firewall-rule.txt"
+          Get-NetFirewallRule -DisplayName sing-tun-test | Get-NetFirewallApplicationFilter | Format-List * | Out-File "$evidence/firewall-program.txt"
+          $exe = Join-Path $evidence 'mapping.test.exe'
+          go test -mod=readonly -c -o $exe .
+          if ($LASTEXITCODE -ne 0) { throw 'cannot build UDP diagnostic binary' }
+          & $exe -test.run '^TestGoKernelPacketMapping$' -test.count 3 -test.v -test.timeout 2m *> "$evidence/fork-program-rule.log"
+          "fork_program_rule=$LASTEXITCODE" | Out-File "$evidence/results.txt"
+          # Keep the application rule and add a rule scoped to the synthetic
+          # TUN ranges, to distinguish WFP filtering from the stack's NAT policy.
+          netsh advfirewall firewall add rule name=sing-tun-udp-diagnostic dir=in action=allow protocol=UDP remoteip=198.18.0.0/15,fd73:ab91::/32 profile=any
+          if ($LASTEXITCODE -ne 0) { throw 'cannot install scoped diagnostic rule' }
+          try {
+            & $exe -test.run '^TestGoKernelPacketMapping$' -test.count 3 -test.v -test.timeout 2m *> "$evidence/fork-scoped-rule.log"
+            "fork_scoped_rule=$LASTEXITCODE" | Out-File -Append "$evidence/results.txt"
+          } finally {
+            netsh advfirewall firewall delete rule name=sing-tun-udp-diagnostic
+          }
+          $baseline = Join-Path $env:RUNNER_TEMP 'upstream-tun-baseline'
+          git worktree add --detach $baseline 1a13df1ac21f721794985aab631a56cf96683fef
+          $modfile = Join-Path $env:GITHUB_WORKSPACE 'go.mod'
+          Push-Location $baseline
+          try {
+            go test "-modfile=$modfile" -mod=readonly -run '^TestGoKernelPacketMapping$' -count 3 -v -timeout 2m . *> "$evidence/upstream-same-dependencies.log"
+            "upstream_same_dependencies=$LASTEXITCODE" | Out-File -Append "$evidence/results.txt"
+          } finally {
+            Pop-Location
+          }
+          Get-Content "$evidence/results.txt"
+          # The preceding Test step remains failed; these runs only add evidence.
+          exit 0
+      - name: Upload Windows UDP diagnostics
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-udp-mapping
+          path: ${{ runner.temp }}/udp-mapping-diagnostics
       - name: Test unprivileged ping
         if: runner.os != 'Linux'
         run: go test -v ./ping
