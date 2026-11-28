@@ -50,7 +50,9 @@ jobs:
           sudo apt-get install -y iproute2
       - name: Test
         env:
-          TEST_FLAGS: ${{ runner.os != 'Windows' && '-exec sudo' || '' }}
+          # Wintun setup and inbound readiness can push the full Windows suite
+          # beyond Go's default ten-minute timeout on hosted runners.
+          TEST_FLAGS: ${{ runner.os == 'Windows' && '-timeout 30m' || '-exec sudo' }}
         run: make test
       - name: Repeat Windows UDP mapping after interface readiness
         if: runner.os == 'Windows'
